@@ -202,6 +202,11 @@ module Checker = struct
     shared_borrows : int;
   }
 
+  type slot_action =
+    | Consume
+    | BeginBorrow
+    | BeginShare
+
   type ownership_state = {
     slots : slot StringMap.t;
     visited_nodes : int;
@@ -312,35 +317,40 @@ module Checker = struct
         let slots' = StringMap.add name next st.slots in
         put { st with slots = slots' }
 
-  let consume_owned (name : string) : unit tc =
-    update_slot name (fun s ->
-        if s.consumed then
-          Error (Ownership_violation ("use-after-move of '" ^ name ^ "'"))
+  let reduce_slot ~(name : string) (action : slot_action) (s : slot) =
+    match action with
+    | Consume ->
+        if s.consumed then Error (Ownership_violation ("use-after-move of '" ^ name ^ "'"))
         else if s.mut_borrowed || s.shared_borrows > 0 then
           Error
             (Ownership_violation
                ("cannot move '" ^ name ^ "' while references are active"))
-        else Ok { s with consumed = true })
-
-  let begin_borrow (name : string) : unit tc =
-    update_slot name (fun s ->
+        else Ok { s with consumed = true }
+    | BeginBorrow ->
         if s.consumed then
           Error (Ownership_violation ("cannot borrow moved value '" ^ name ^ "'"))
         else if s.mut_borrowed || s.shared_borrows > 0 then
           Error
             (Ownership_violation
                ("cannot mutably borrow '" ^ name ^ "' while aliased"))
-        else Ok { s with mut_borrowed = true })
-
-  let begin_share (name : string) : unit tc =
-    update_slot name (fun s ->
+        else Ok { s with mut_borrowed = true }
+    | BeginShare ->
         if s.consumed then
           Error (Ownership_violation ("cannot share moved value '" ^ name ^ "'"))
         else if s.mut_borrowed then
           Error
             (Ownership_violation
                ("cannot create shared refs while '" ^ name ^ "' is mutably borrowed"))
-        else Ok { s with shared_borrows = s.shared_borrows + 1 })
+        else Ok { s with shared_borrows = s.shared_borrows + 1 }
+
+  let consume_owned (name : string) : unit tc =
+    update_slot name (reduce_slot ~name Consume)
+
+  let begin_borrow (name : string) : unit tc =
+    update_slot name (reduce_slot ~name BeginBorrow)
+
+  let begin_share (name : string) : unit tc =
+    update_slot name (reduce_slot ~name BeginShare)
 
   let ensure_type expected actual =
     if Type.equal expected actual then return ()
