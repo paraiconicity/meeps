@@ -196,21 +196,71 @@ module Checker = struct
 
   type context = binding StringMap.t
 
-  type slot = {
-    consumed : bool;
-    mut_borrowed : bool;
-    shared_borrows : int;
-  }
+  module State = struct
+    type slot = {
+      consumed : bool;
+      mut_borrowed : bool;
+      shared_borrows : int;
+    }
 
-  type slot_action =
-    | Consume
-    | BeginBorrow
-    | BeginShare
+    type slot_action =
+      | Consume
+      | BeginBorrow
+      | BeginShare
 
-  type ownership_state = {
-    slots : slot StringMap.t;
-    visited_nodes : int;
-  }
+    type t = {
+      slots : slot StringMap.t;
+      visited_nodes : int;
+    }
+
+    let initial_slot = { consumed = false; mut_borrowed = false; shared_borrows = 0 }
+
+    let bootstrap (ctx : context) =
+      let slots =
+        StringMap.fold
+          (fun name binding acc ->
+            match binding.mode with
+            | `Owned -> StringMap.add name initial_slot acc
+            | `Borrowed | `Shared -> acc)
+          ctx StringMap.empty
+      in
+      { slots; visited_nodes = 0 }
+
+    let slot_equal a b =
+      a.consumed = b.consumed
+      && a.mut_borrowed = b.mut_borrowed
+      && a.shared_borrows = b.shared_borrows
+
+    let equal a b = StringMap.equal slot_equal a.slots b.slots
+
+    let transition_slot ~(name : string) (action : slot_action) (s : slot) =
+      match action with
+      | Consume ->
+          if s.consumed then Error (Ownership_violation ("use-after-move of '" ^ name ^ "'"))
+          else if s.mut_borrowed || s.shared_borrows > 0 then
+            Error
+              (Ownership_violation
+                 ("cannot move '" ^ name ^ "' while references are active"))
+          else Ok { s with consumed = true }
+      | BeginBorrow ->
+          if s.consumed then
+            Error (Ownership_violation ("cannot borrow moved value '" ^ name ^ "'"))
+          else if s.mut_borrowed || s.shared_borrows > 0 then
+            Error
+              (Ownership_violation
+                 ("cannot mutably borrow '" ^ name ^ "' while aliased"))
+          else Ok { s with mut_borrowed = true }
+      | BeginShare ->
+          if s.consumed then
+            Error (Ownership_violation ("cannot share moved value '" ^ name ^ "'"))
+          else if s.mut_borrowed then
+            Error
+              (Ownership_violation
+                 ("cannot create shared refs while '" ^ name ^ "' is mutably borrowed"))
+          else Ok { s with shared_borrows = s.shared_borrows + 1 }
+  end
+
+  type ownership_state = State.t
 
   type env = {
     ctx : context;
@@ -238,25 +288,8 @@ module Checker = struct
     m { ctx = context; config; depth = 0 } state
 
   let empty_context = StringMap.empty
-  let initial_slot = { consumed = false; mut_borrowed = false; shared_borrows = 0 }
-
-  let bootstrap_state (ctx : context) =
-    let slots =
-      StringMap.fold
-        (fun name binding acc ->
-          match binding.mode with
-          | `Owned -> StringMap.add name initial_slot acc
-          | `Borrowed | `Shared -> acc)
-        ctx StringMap.empty
-    in
-    { slots; visited_nodes = 0 }
-
-  let slot_equal a b =
-    a.consumed = b.consumed
-    && a.mut_borrowed = b.mut_borrowed
-    && a.shared_borrows = b.shared_borrows
-
-  let state_equal a b = StringMap.equal slot_equal a.slots b.slots
+  let bootstrap_state = State.bootstrap
+  let state_equal = State.equal
 
   let bump_node : unit tc =
    fun env st ->
@@ -294,7 +327,7 @@ module Checker = struct
     let ctx' = StringMap.add name binding env.ctx in
     let slots' =
       match binding.mode with
-      | `Owned -> StringMap.add name initial_slot st.slots
+      | `Owned -> StringMap.add name State.initial_slot st.slots
       | `Borrowed | `Shared -> st.slots
     in
     let st' = { st with slots = slots' } in
@@ -304,12 +337,12 @@ module Checker = struct
         let cleaned = { out_state with slots = StringMap.remove name out_state.slots } in
         Ok (x, cleaned)
 
-  let update_slot (name : string) (f : slot -> (slot, error) result) : unit tc =
+  let update_slot (name : string) (f : State.slot -> (State.slot, error) result) : unit tc =
     let* st = get in
     let current =
       match StringMap.find_opt name st.slots with
       | Some slot -> slot
-      | None -> initial_slot
+      | None -> State.initial_slot
     in
     match f current with
     | Error e -> throw e
@@ -317,31 +350,8 @@ module Checker = struct
         let slots' = StringMap.add name next st.slots in
         put { st with slots = slots' }
 
-  let reduce_slot ~(name : string) (action : slot_action) (s : slot) =
-    match action with
-    | Consume ->
-        if s.consumed then Error (Ownership_violation ("use-after-move of '" ^ name ^ "'"))
-        else if s.mut_borrowed || s.shared_borrows > 0 then
-          Error
-            (Ownership_violation
-               ("cannot move '" ^ name ^ "' while references are active"))
-        else Ok { s with consumed = true }
-    | BeginBorrow ->
-        if s.consumed then
-          Error (Ownership_violation ("cannot borrow moved value '" ^ name ^ "'"))
-        else if s.mut_borrowed || s.shared_borrows > 0 then
-          Error
-            (Ownership_violation
-               ("cannot mutably borrow '" ^ name ^ "' while aliased"))
-        else Ok { s with mut_borrowed = true }
-    | BeginShare ->
-        if s.consumed then
-          Error (Ownership_violation ("cannot share moved value '" ^ name ^ "'"))
-        else if s.mut_borrowed then
-          Error
-            (Ownership_violation
-               ("cannot create shared refs while '" ^ name ^ "' is mutably borrowed"))
-        else Ok { s with shared_borrows = s.shared_borrows + 1 }
+  let reduce_slot ~(name : string) (action : State.slot_action) (s : State.slot) =
+    State.transition_slot ~name action s
 
   let consume_owned (name : string) : unit tc =
     update_slot name (reduce_slot ~name Consume)
@@ -564,7 +574,7 @@ module Checker = struct
                       | Ok ctx' ->
                           let slots' =
                             match binding.mode with
-                            | `Owned -> StringMap.add name initial_slot st'.slots
+                            | `Owned -> StringMap.add name State.initial_slot st'.slots
                             | `Borrowed | `Shared -> st'.slots
                           in
                           let st'' = { st' with slots = slots' } in
@@ -621,7 +631,7 @@ module Checker = struct
           t.ctx <- ctx';
           let slots' =
             match binding.mode with
-            | `Owned -> StringMap.add name initial_slot t.st.slots
+            | `Owned -> StringMap.add name State.initial_slot t.st.slots
             | `Borrowed | `Shared -> t.st.slots
           in
           t.st <- { t.st with slots = slots' };
