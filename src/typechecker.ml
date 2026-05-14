@@ -354,12 +354,12 @@ module Checker = struct
     | Syntax.Bool b -> return (mk Type.TBool (Elaborated.EBool b))
     | Syntax.Unit -> return (mk Type.TUnit Elaborated.EUnit)
     | Syntax.Pair (a, b) ->
-        let* ea = with_depth (infer_typed_expr a) in
-        let* eb = with_depth (infer_typed_expr b) in
+        let* ea = infer_once a in
+        let* eb = infer_once b in
         return (mk (Type.TPair (ea.ty, eb.ty)) (Elaborated.EPair (ea, eb)))
     | Syntax.Ann (inner, ty) ->
-        let* () = with_depth (check_expr inner ty) in
-        let* ein = with_depth (infer_typed_expr inner) in
+        let* ein = infer_once inner in
+        let* () = ensure_type ty ein.ty in
         return (mk ty (Elaborated.EAnn (ein, ty)))
     | Syntax.Lam (arg, mode, arg_ty_opt, body) ->
         let* arg_ty =
@@ -372,73 +372,59 @@ module Checker = struct
         in
         let arg_binding = { ty = arg_ty; mode = mode_of_binder mode } in
         let* body_typed =
-          with_binding ~name:arg ~binding:arg_binding
-            (with_depth (infer_typed_expr body))
+          with_binding ~name:arg ~binding:arg_binding (infer_once body)
         in
         let ty = Type.TFun (arg_ty, body_typed.ty) in
         return (mk ty (Elaborated.ELam (arg, mode, arg_ty, body_typed)))
     | Syntax.App (f, arg) ->
-        let* ef = with_depth (infer_typed_expr f) in
+        let* ef = infer_once f in
         (match ef.ty with
         | Type.TFun (in_ty, out_ty) ->
-            let* () = with_depth (check_expr arg in_ty) in
-            let* ea = with_depth (infer_typed_expr arg) in
+            let* ea = ensure_inferred_type arg in_ty in
             return (mk out_ty (Elaborated.EApp (ef, ea)))
         | not_fun -> throw (Expected_function not_fun))
     | Syntax.Let (name, mode, ann_opt, value, body) ->
         let* value_typed =
           match ann_opt with
           | Some expected ->
-              let* () = with_depth (check_expr value expected) in
-              let* ev = with_depth (infer_typed_expr value) in
+              let* ev = ensure_inferred_type value expected in
               return (mk expected ev.node)
-          | None -> with_depth (infer_typed_expr value)
+          | None -> infer_once value
         in
         let binding = { ty = value_typed.ty; mode = mode_of_binder mode } in
         let* body_typed =
-          with_binding ~name ~binding (with_depth (infer_typed_expr body))
+          with_binding ~name ~binding (infer_once body)
         in
         return
           (mk body_typed.ty
              (Elaborated.ELet (name, mode, value_typed.ty, value_typed, body_typed)))
     | Syntax.If (cond, then_e, else_e) ->
+        let* cond_typed = infer_once cond in
+        let* () = ensure_type Type.TBool cond_typed.ty in
         (fun env st0 ->
-          match with_depth (check_expr cond Type.TBool) env st0 with
+          match with_depth (infer_typed_expr then_e) env st0 with
           | Error e -> Error e
-          | Ok ((), st_after_cond) ->
+          | Ok (then_typed, then_st) ->
               begin
-                match with_depth (infer_typed_expr cond) env st_after_cond with
+                match with_depth (infer_typed_expr else_e) env st0 with
                 | Error e -> Error e
-                | Ok (cond_typed, st_after_cond_typed) ->
-                    begin
-                      match with_depth (infer_typed_expr then_e) env st_after_cond_typed with
-                      | Error e -> Error e
-                      | Ok (then_typed, then_st) ->
-                          begin
-                            match
-                              with_depth (infer_typed_expr else_e) env st_after_cond_typed
-                            with
-                            | Error e -> Error e
-                            | Ok (else_typed, else_st) ->
-                                if not (Type.equal then_typed.ty else_typed.ty) then
-                                  Error
-                                    (Type_mismatch
-                                       {
-                                         expected = then_typed.ty;
-                                         actual = else_typed.ty;
-                                       })
-                                else if not (state_equal then_st else_st) then
-                                  Error
-                                    (Branch_ownership_mismatch
-                                       "if branches must leave ownership in equivalent states")
-                                else
-                                  Ok
-                                    ( mk then_typed.ty
-                                        (Elaborated.EIf
-                                           (cond_typed, then_typed, else_typed)),
-                                      then_st )
-                          end
-                    end
+                | Ok (else_typed, else_st) ->
+                    if not (Type.equal then_typed.ty else_typed.ty) then
+                      Error
+                        (Type_mismatch
+                           {
+                             expected = then_typed.ty;
+                             actual = else_typed.ty;
+                           })
+                    else if not (state_equal then_st else_st) then
+                      Error
+                        (Branch_ownership_mismatch
+                           "if branches must leave ownership in equivalent states")
+                    else
+                      Ok
+                        ( mk then_typed.ty
+                            (Elaborated.EIf (cond_typed, then_typed, else_typed)),
+                          then_st )
               end)
     | Syntax.Borrow name ->
         let* b = lookup_binding name in
@@ -470,6 +456,13 @@ module Checker = struct
             let ty = Ownership.erase (Ownership.shared b.ty) in
             return (mk ty (Elaborated.EShare name)))
 
+  and infer_once (expr : Syntax.expr) : Elaborated.expr tc = with_depth (infer_typed_expr expr)
+
+  and ensure_inferred_type (expr : Syntax.expr) (expected : Type.t) : Elaborated.expr tc =
+    let* actual = infer_once expr in
+    let* () = ensure_type expected actual.ty in
+    return actual
+
   and check_expr (expr : Syntax.expr) (expected : Type.t) : unit tc =
     let* () = bump_node in
     match (expr, expected) with
@@ -481,9 +474,9 @@ module Checker = struct
         in
         let arg_binding = { ty = in_ty; mode = mode_of_binder mode } in
         with_binding ~name:arg ~binding:arg_binding
-          (with_depth (check_expr body out_ty))
+          (check_expr body out_ty)
     | _ ->
-        let* actual = with_depth (infer_typed_expr expr) in
+        let* actual = infer_once expr in
         ensure_type expected actual.ty
 
   let infer ?(config = Config.strict) ?(context = empty_context) expr =
