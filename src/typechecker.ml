@@ -421,31 +421,7 @@ module Checker = struct
     | Syntax.If (cond, then_e, else_e) ->
         let* cond_typed = infer_once cond in
         let* () = ensure_type Type.TBool cond_typed.ty in
-        (fun env st0 ->
-          match with_depth (infer_typed_expr then_e) env st0 with
-          | Error e -> Error e
-          | Ok (then_typed, then_st) ->
-              begin
-                match with_depth (infer_typed_expr else_e) env st0 with
-                | Error e -> Error e
-                | Ok (else_typed, else_st) ->
-                    if not (Type.equal then_typed.ty else_typed.ty) then
-                      Error
-                        (Type_mismatch
-                           {
-                             expected = then_typed.ty;
-                             actual = else_typed.ty;
-                           })
-                    else if not (state_equal then_st else_st) then
-                      Error
-                        (Branch_ownership_mismatch
-                           "if branches must leave ownership in equivalent states")
-                    else
-                      Ok
-                        ( mk then_typed.ty
-                            (Elaborated.EIf (cond_typed, then_typed, else_typed)),
-                          then_st )
-              end)
+        infer_if_branches cond_typed then_e else_e
     | Syntax.Borrow name ->
         let* b = lookup_binding name in
         (match b.mode with
@@ -482,6 +458,36 @@ module Checker = struct
     let* actual = infer_once expr in
     let* () = ensure_type expected actual.ty in
     return actual
+
+  and infer_if_branches
+      (cond_typed : Elaborated.expr)
+      (then_e : Syntax.expr)
+      (else_e : Syntax.expr) : Elaborated.expr tc =
+    fun env st0 ->
+      match with_depth (infer_typed_expr then_e) env st0 with
+      | Error e -> Error e
+      | Ok (then_typed, then_st) ->
+          begin
+            match with_depth (infer_typed_expr else_e) env st0 with
+            | Error e -> Error e
+            | Ok (else_typed, else_st) ->
+                if not (Type.equal then_typed.ty else_typed.ty) then
+                  Error
+                    (Type_mismatch
+                       {
+                         expected = then_typed.ty;
+                         actual = else_typed.ty;
+                       })
+                else if not (state_equal then_st else_st) then
+                  Error
+                    (Branch_ownership_mismatch
+                       "if branches must leave ownership in equivalent states")
+                else
+                  Ok
+                    ( mk then_typed.ty
+                        (Elaborated.EIf (cond_typed, then_typed, else_typed)),
+                      then_st )
+          end
 
   and check_expr (expr : Syntax.expr) (expected : Type.t) : unit tc =
     let* () = bump_node in
