@@ -44,11 +44,22 @@ end
 module Config : sig
   type profile = [ `Strict | `Research | `Legacy ]
 
+  type validation_error =
+    | Non_positive_max_nodes of int
+    | Non_positive_max_depth of int
+
   type t = {
     profile : profile;
     max_nodes : int;
     max_depth : int;
   }
+
+  val make :
+    ?profile:profile ->
+    max_nodes:int ->
+    max_depth:int ->
+    unit ->
+    (t, validation_error) result
 
   val strict : t
   val research : t

@@ -53,15 +53,35 @@ end
 module Config = struct
   type profile = [ `Strict | `Research | `Legacy ]
 
+  type validation_error =
+    | Non_positive_max_nodes of int
+    | Non_positive_max_depth of int
+
   type t = {
     profile : profile;
     max_nodes : int;
     max_depth : int;
   }
 
-  let strict = { profile = `Strict; max_nodes = 250_000; max_depth = 4_096 }
-  let research = { profile = `Research; max_nodes = 1_000_000; max_depth = 16_384 }
-  let legacy = { profile = `Legacy; max_nodes = 200_000; max_depth = 2_048 }
+  let make ?(profile = `Strict) ~max_nodes ~max_depth () =
+    if max_nodes <= 0 then Error (Non_positive_max_nodes max_nodes)
+    else if max_depth <= 0 then Error (Non_positive_max_depth max_depth)
+    else Ok { profile; max_nodes; max_depth }
+
+  let strict =
+    match make ~profile:`Strict ~max_nodes:250_000 ~max_depth:4_096 () with
+    | Ok config -> config
+    | Error _ -> failwith "invalid strict checker configuration"
+
+  let research =
+    match make ~profile:`Research ~max_nodes:1_000_000 ~max_depth:16_384 () with
+    | Ok config -> config
+    | Error _ -> failwith "invalid research checker configuration"
+
+  let legacy =
+    match make ~profile:`Legacy ~max_nodes:200_000 ~max_depth:2_048 () with
+    | Ok config -> config
+    | Error _ -> failwith "invalid legacy checker configuration"
 end
 
 module Type = struct
